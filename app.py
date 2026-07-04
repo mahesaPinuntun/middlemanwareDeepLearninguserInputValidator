@@ -1,7 +1,7 @@
 """
 FastAPI service that scans a JSON object (uploaded file or raw body) for
 suspicious (XSS / SQL injection) content, field by field, using the
-trained CharCNNBiLSTM model.
+trained CharCNNBiLSTM model — served via ONNX Runtime (no torch required).
 
 WHY FIELD-BY-FIELD:
 Testing earlier showed the model scores nonsense on a whole raw HTTP
@@ -17,74 +17,63 @@ Run with:
 Then either:
     - POST a JSON body directly to /scan
     - POST a .json file to /scan-file
+
+Requirements:
+    pip install fastapi uvicorn onnxruntime numpy
 """
 
 import json
-import torch
-import torch.nn as nn
+import numpy as np
+import onnxruntime as ort
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
 from typing import Any, Dict, List, Union
 
 # ---------------------------------------------------------------------
-# Model definition (must match train.py exactly)
+# Load ONNX model + vocab metadata once at startup
 # ---------------------------------------------------------------------
-class CharCNNBiLSTM(nn.Module):
-    def __init__(self, vocab_size, emb_dim=32, cnn_channels=64, lstm_hidden=64):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
-        self.conv1 = nn.Conv1d(emb_dim, cnn_channels, kernel_size=5, padding=2)
-        self.conv2 = nn.Conv1d(cnn_channels, cnn_channels, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool1d(2)
-        self.lstm = nn.LSTM(cnn_channels, lstm_hidden, batch_first=True, bidirectional=True)
-        self.dropout = nn.Dropout(0.3)
-        self.fc1 = nn.Linear(lstm_hidden * 2, 64)
-        self.fc2 = nn.Linear(64, 1)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        e = self.embedding(x).permute(0, 2, 1)
-        c = self.relu(self.conv1(e)); c = self.pool(c)
-        c = self.relu(self.conv2(c)); c = self.pool(c)
-        c = c.permute(0, 2, 1)
-        out, (h, _) = self.lstm(c)
-        h_cat = torch.cat([h[0], h[1]], dim=1)
-        h_cat = self.dropout(h_cat)
-        z = self.relu(self.fc1(h_cat))
-        logit = self.fc2(z).squeeze(1)
-        return logit
-
-# ---------------------------------------------------------------------
-# Load trained model + vocab once at startup
-# ---------------------------------------------------------------------
-MODEL_PATH = "best_model.pt"
+ONNX_MODEL_PATH = "best_model.onnx"
+VOCAB_PATH = "vocab.json"  # see note below re: where char2idx/max_len come from
 THRESHOLD = 0.5  # tune this: lower = catch more attacks, more false positives
 
-device = torch.device("cpu")
-ckpt = torch.load(MODEL_PATH, map_location=device)
-char2idx = ckpt["char2idx"]
-max_len = ckpt["max_len"]
-vocab_size = ckpt["vocab_size"]
+# torch.onnx.export only serializes the model's weights/graph, not the
+# char2idx dict or max_len that train.py saved alongside the state_dict in
+# best_model.pt. You need those two values here as plain Python objects.
+# Easiest fix: dump them once from your training run, e.g.
+#
+#   ckpt = torch.load("best_model.pt", map_location="cpu")
+#   json.dump({"char2idx": ckpt["char2idx"], "max_len": ckpt["max_len"]},
+#             open("vocab.json", "w"))
+#
+# then load that json file here -- no torch needed at serve time.
+with open(VOCAB_PATH, "r", encoding="utf-8") as f:
+    vocab_meta = json.load(f)
 
-model = CharCNNBiLSTM(vocab_size)
-model.load_state_dict(ckpt["model_state"])
-model.eval()
+char2idx: Dict[str, int] = vocab_meta["char2idx"]
+max_len: int = vocab_meta["max_len"]
+
+session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+INPUT_NAME = session.get_inputs()[0].name
+OUTPUT_NAME = session.get_outputs()[0].name
 
 
-def encode(text: str, max_len: int = max_len):
+def encode(text: str, max_len: int = max_len) -> List[int]:
     ids = [char2idx.get(c, 1) for c in text[:max_len]]
     if len(ids) < max_len:
         ids = ids + [0] * (max_len - len(ids))
     return ids
 
 
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
 def score_string(text: str) -> float:
-    """Return P(suspicious) for a single string."""
+    """Return P(suspicious) for a single string using the ONNX model."""
     if not text.strip():
         return 0.0
-    x = torch.tensor([encode(text)], dtype=torch.long)
-    with torch.no_grad():
-        prob = torch.sigmoid(model(x)).item()
+    x = np.array([encode(text)], dtype=np.int64)  # (1, max_len)
+    logit = session.run([OUTPUT_NAME], {INPUT_NAME: x})[0]  # raw logit, model has no sigmoid layer
+    prob = float(sigmoid(logit)[0])
     return prob
 
 
@@ -137,7 +126,7 @@ def scan_json_object(obj: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 app = FastAPI(
     title="XSS / SQLi JSON Scanner",
-    description="Scores each string field in a JSON payload for XSS/SQL-injection risk.",
+    description="Scores each string field in a JSON payload for XSS/SQL-injection risk (ONNX Runtime).",
     version="1.0.0",
 )
 
