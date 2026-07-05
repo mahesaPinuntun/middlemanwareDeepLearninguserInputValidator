@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Union
 # ---------------------------------------------------------------------
 ONNX_MODEL_PATH = "best_model.onnx"
 VOCAB_PATH = "vocab.json"  # see note below re: where char2idx/max_len come from
-THRESHOLD = 0.17 # tune this: lower = catch more attacks, more false positives
+THRESHOLD = 0.8 # tune this: lower = catch more attacks, more false positives
 
 # torch.onnx.export only serializes the model's weights/graph, not the
 # char2idx dict or max_len that train.py saved alongside the state_dict in
